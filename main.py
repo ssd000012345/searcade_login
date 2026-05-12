@@ -1,184 +1,110 @@
 import os
 import asyncio
-from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+import httpx
+from urllib.parse import urlencode, urlparse, parse_qs
 
 async def run():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,  # 改为有头模式，减少 bot 检测
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process',
-            ]
+    email = os.environ.get("SEARCADE_EMAIL")
+    password = os.environ.get("SEARCADE_PASSWORD")
+
+    if not email or not password:
+        raise ValueError("未设置 SEARCADE_EMAIL 或 SEARCADE_PASSWORD")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://userveria.com",
+        "Referer": "https://userveria.com/",
+    }
+
+    # OAuth 参数（从 URL 中提取）
+    oauth_params = {
+        "client_id": "8305d2e2-e91f-4deb-8909-f669259bc23f",
+        "redirect_uri": "https://searcade.com/accounts/userveria/login/callback/",
+        "scope": "profile",
+        "response_type": "code",
+    }
+
+    async with httpx.AsyncClient(
+        headers=headers,
+        follow_redirects=True,
+        timeout=30.0
+    ) as client:
+
+        print("Step 1: 访问 OAuth 授权页面获取 state...")
+        authorize_url = f"https://userveria.com/authorize/?{urlencode(oauth_params)}"
+        resp = await client.get(authorize_url)
+        print(f"  状态码: {resp.status_code}")
+        print(f"  最终 URL: {resp.url}")
+
+        # 从 URL 中提取 state
+        state = parse_qs(urlparse(str(resp.url)).query).get("state", [None])[0]
+        print(f"  State: {state}")
+
+        print("\nStep 2: 调用 userveria 登录 API...")
+        login_payload = {
+            "email": email,
+            "password": password,
+        }
+
+        # 尝试 userveria 的登录接口
+        login_resp = await client.post(
+            "https://userveria.com/api/auth/login",
+            json=login_payload,
+            headers={
+                **headers,
+                "Content-Type": "application/json",
+                "Referer": authorize_url,
+            }
         )
+        print(f"  登录状态码: {login_resp.status_code}")
+        print(f"  登录响应: {login_resp.text[:500]}")
 
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={'width': 1280, 'height': 720},
-            locale='en-US',
-            timezone_id='America/New_York',
-        )
+        if login_resp.status_code not in (200, 201, 302):
+            # 尝试其他可能的 API 路径
+            for api_path in [
+                "/api/auth/signin",
+                "/api/login",
+                "/api/v1/auth/login",
+                "/auth/login",
+            ]:
+                print(f"\n  尝试路径: {api_path}")
+                r = await client.post(
+                    f"https://userveria.com{api_path}",
+                    json=login_payload,
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+                print(f"  状态码: {r.status_code}, 响应: {r.text[:200]}")
+                if r.status_code in (200, 201):
+                    login_resp = r
+                    break
 
-        page = await context.new_page()
-        await stealth_async(page)
-
-        try:
-            print("正在访问首页...")
-            await page.goto(
-                "https://searcade.com/en/",
-                wait_until="networkidle",
-                timeout=60000
+        print("\nStep 3: 完成 OAuth 授权回调...")
+        # 携带 state 完成授权
+        if state:
+            authorize_payload = {
+                "state": state,
+                **oauth_params,
+            }
+            auth_resp = await client.post(
+                "https://userveria.com/api/authorize",
+                json=authorize_payload,
+                headers={**headers, "Content-Type": "application/json"},
             )
-            await asyncio.sleep(2)
-            await page.screenshot(path="before_login.png")
+            print(f"  授权状态码: {auth_resp.status_code}")
+            print(f"  授权响应: {auth_resp.text[:300]}")
 
-            print("点击登录按钮...")
-            # 等待 Login 链接出现并点击
-            await page.wait_for_selector("text=Login", timeout=15000)
-            await page.click("text=Login")
+        print("\nStep 4: 验证登录状态...")
+        check_resp = await client.get("https://searcade.com/en/admin/")
+        print(f"  Admin 页面状态码: {check_resp.status_code}")
+        print(f"  最终 URL: {check_resp.url}")
 
-            print("等待跳转到认证页面...")
-            # 等待页面跳转到 userveria
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            await asyncio.sleep(3)
-
-            current_url = page.url
-            print(f"当前 URL: {current_url}")
-            await page.screenshot(path="after_click_login.png")
-
-            # 打印页面内容用于调试
-            content = await page.content()
-            print(f"页面标题: {await page.title()}")
-            print(f"页面内容片段: {content[:500]}")
-
-            email = os.environ.get("SEARCADE_EMAIL")
-            password = os.environ.get("SEARCADE_PASSWORD")
-
-            if not email or not password:
-                raise ValueError("未设置 SEARCADE_EMAIL 或 SEARCADE_PASSWORD")
-
-            print("等待邮箱输入框...")
-            # 尝试多种选择器
-            email_selectors = [
-                'input[type="email"]',
-                'input[name="email"]',
-                'input[placeholder*="email" i]',
-                'input[placeholder*="Email" i]',
-                'input[id*="email" i]',
-                '#email',
-            ]
-
-            email_input = None
-            for selector in email_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=5000)
-                    email_input = selector
-                    print(f"✅ 找到邮箱输入框: {selector}")
-                    break
-                except Exception:
-                    print(f"❌ 未找到: {selector}")
-                    continue
-
-            if not email_input:
-                # 输出所有 input 元素的信息
-                inputs = await page.query_selector_all('input')
-                print(f"页面上共有 {len(inputs)} 个 input 元素:")
-                for i, inp in enumerate(inputs):
-                    inp_type = await inp.get_attribute('type')
-                    inp_name = await inp.get_attribute('name')
-                    inp_id = await inp.get_attribute('id')
-                    inp_placeholder = await inp.get_attribute('placeholder')
-                    print(f"  input[{i}]: type={inp_type}, name={inp_name}, id={inp_id}, placeholder={inp_placeholder}")
-                raise Exception("无法找到邮箱输入框，请查看截图和日志")
-
-            print("填写邮箱...")
-            await page.fill(email_input, email)
-            await asyncio.sleep(1)
-
-            # 查找并点击"继续"按钮
-            continue_selectors = [
-                "text=Continue with email",
-                "text=Continue",
-                "button[type='submit']",
-                'button:has-text("Continue")',
-            ]
-
-            for selector in continue_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=3000)
-                    await page.click(selector)
-                    print(f"✅ 点击了继续按钮: {selector}")
-                    break
-                except Exception:
-                    continue
-
-            print("等待密码输入框...")
-            await page.wait_for_load_state("networkidle", timeout=15000)
-            await asyncio.sleep(2)
-            await page.screenshot(path="after_email.png")
-
-            password_selectors = [
-                'input[type="password"]',
-                'input[name="password"]',
-                '#password',
-            ]
-
-            password_input = None
-            for selector in password_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=5000)
-                    password_input = selector
-                    print(f"✅ 找到密码输入框: {selector}")
-                    break
-                except Exception:
-                    continue
-
-            if not password_input:
-                raise Exception("无法找到密码输入框")
-
-            print("填写密码并登录...")
-            await page.fill(password_input, password)
-            await asyncio.sleep(1)
-
-            login_selectors = [
-                "button:has-text('Log in')",
-                "button:has-text('Login')",
-                "button:has-text('Sign in')",
-                "button[type='submit']",
-            ]
-
-            for selector in login_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=3000)
-                    await page.click(selector)
-                    print(f"✅ 点击了登录按钮: {selector}")
-                    break
-                except Exception:
-                    continue
-
-            print("等待跳转到管理后台...")
-            await page.wait_for_url("**/admin**", timeout=30000)
-            await asyncio.sleep(6)
-
-            await page.screenshot(path="after_login.png")
-            print("✅ 登录成功！")
-
-        except Exception as e:
-            print(f"❌ 发生错误: {e}")
-            try:
-                await page.screenshot(path="error_state.png")
-            except Exception:
-                pass
-            import traceback
-            traceback.print_exc()
-            raise
-
-        finally:
-            await browser.close()
+        if "/admin" in str(check_resp.url):
+            print("✅ 登录成功！已进入 Admin 后台")
+        else:
+            print(f"⚠️ 当前 URL: {check_resp.url}")
+            print("  需要查看日志进一步分析")
 
 if __name__ == "__main__":
     asyncio.run(run())
