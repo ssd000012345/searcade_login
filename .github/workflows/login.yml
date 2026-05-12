@@ -31,7 +31,7 @@ jobs:
           SEARCADE_PASSWORD: ${{ secrets.SEARCADE_PASSWORD }}
         run: python main.py
 
-      - name: 保存截图到 Artifacts
+      - name: 保存截图和录屏到 Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -40,5 +40,6 @@ jobs:
             before_login.png
             after_login.png
             after_login_admin.png
+            videos/  # 如果录屏保存到 videos 目录，会上传整个文件夹
           retention-days: 7
           if-no-files-found: ignore
