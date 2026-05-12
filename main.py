@@ -1,7 +1,7 @@
 import os
 import asyncio
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async  # 导入 stealth 插件
+from playwright_stealth import stealth            # 导入 stealth 插件
 
 async def run():
     async with async_playwright() as p:
@@ -17,8 +17,8 @@ async def run():
         page = await context.new_page()
 
         # 对当前页面应用 stealth 插件
-        await stealth_async(page)
-
+        await stealth(page)
+                                                                        
         # 1. 访问首页
         print("正在访问首页...")
         await page.goto("https://searcade.com/en/", wait_until="networkidle")
