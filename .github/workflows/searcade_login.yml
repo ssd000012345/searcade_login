@@ -2,7 +2,7 @@ name: Searcade Auto Login (pydoll)
 
 on:
   schedule:
-    - cron: '0 0 */3 * *'   # 每三天一次
+    - cron: '0 0 */3 * *'
   workflow_dispatch:
 
 jobs:
@@ -19,10 +19,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 安装系统依赖 (Chromium + ffmpeg + xvfb + 中文字体)
+      - name: 安装系统依赖 (Chromium + ffmpeg + xvfb)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq chromium-browser xvfb ffmpeg curl unzip fonts-noto-cjk
+          sudo apt-get install -y -qq chromium-browser xvfb ffmpeg curl unzip
 
       - name: 安装 Python 依赖
         run: pip install -r requirements.txt
