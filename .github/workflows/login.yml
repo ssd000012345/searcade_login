@@ -2,9 +2,9 @@ name: Searcade Auto Login
 
 on:
   schedule:
-    # 每三天运行一次 (UTC时间 0:00，北京时间 8:00)
+    # 每三天运行一次 (北京时间早上 8:00)
     - cron: '0 0 */3 * *'
-  workflow_dispatch: # 允许手动触发测试
+  workflow_dispatch:  # 允许手动触发测试
 
 jobs:
   login_job:
@@ -19,12 +19,13 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 安装依赖
+      - name: 安装系统依赖和 Playwright
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2
           python -m pip install --upgrade pip
-          pip install --upgrade playwright-stealth   # 确保最新版本
-          pip install playwright
-          playwright install chromium
+          pip install playwright playwright-stealth
+          playwright install chromium --with-deps
 
       - name: 执行登录脚本
         env:
@@ -32,13 +33,14 @@ jobs:
           SEARCADE_PASSWORD: ${{ secrets.SEARCADE_PASSWORD }}
         run: python main.py
 
-      - name: 保存截图到 Artifacts
-        if: always() 
+      - name: 保存截图和日志到 Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: login-results-${{ github.run_id }}
+          name: searcade-login-results-${{ github.run_id }}
           path: |
             before_login.png
             after_login.png
             error_state.png
+            *.log
           retention-days: 7
