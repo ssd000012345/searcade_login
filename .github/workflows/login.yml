@@ -4,7 +4,7 @@ on:
   schedule:
     # 每三天运行一次 (UTC时间 0:00，北京时间 8:00)
     - cron: '0 0 */3 * *'
-  workflow_dispatch: # 允许你手动点击 "Run workflow" 进行测试
+  workflow_dispatch: # 允许手动触发测试
 
 jobs:
   login_job:
@@ -26,19 +26,18 @@ jobs:
           playwright install chromium
 
       - name: 执行登录脚本
-        # 这里的变量需要你在 GitHub Repo 的 Settings -> Secrets 中设置
         env:
           SEARCADE_EMAIL: ${{ secrets.SEARCADE_EMAIL }}
           SEARCADE_PASSWORD: ${{ secrets.SEARCADE_PASSWORD }}
         run: python main.py
 
       - name: 保存截图到 Artifacts
-        if: always() # 无论脚本成功还是失败，都尝试上传截图以便排查
-        uses: upload-artifact@v4
+        if: always() 
+        uses: actions/upload-artifact@v4
         with:
           name: login-results-${{ github.run_id }}
           path: |
             before_login.png
             after_login.png
             error_state.png
-          retention-days: 7 # 截图保留7天
+          retention-days: 7
