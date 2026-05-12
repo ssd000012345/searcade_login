@@ -27,7 +27,8 @@ jobs:
             libxfixes3 libxrandr2 libgbm1 libasound2t64 libatspi2.0-0 libxshmfence1
           
           python -m pip install --upgrade pip
-          pip install playwright playwright-stealth
+          pip install "playwright==1.40.0"
+          pip install "playwright-stealth==1.0.6"
           playwright install chromium --with-deps
 
       - name: 执行登录脚本
@@ -46,3 +47,4 @@ jobs:
             after_login.png
             error_state.png
           retention-days: 7
+          if-no-files-found: ignore
