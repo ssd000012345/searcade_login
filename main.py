@@ -1,7 +1,8 @@
 import os
 import asyncio
-import httpx
+from curl_cffi.requests import AsyncSession
 from urllib.parse import urlencode, urlparse, parse_qs
+import json
 
 async def run():
     email = os.environ.get("SEARCADE_EMAIL")
@@ -10,15 +11,6 @@ async def run():
     if not email or not password:
         raise ValueError("未设置 SEARCADE_EMAIL 或 SEARCADE_PASSWORD")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Origin": "https://userveria.com",
-        "Referer": "https://userveria.com/",
-    }
-
-    # OAuth 参数（从 URL 中提取）
     oauth_params = {
         "client_id": "8305d2e2-e91f-4deb-8909-f669259bc23f",
         "redirect_uri": "https://searcade.com/accounts/userveria/login/callback/",
@@ -26,85 +18,129 @@ async def run():
         "response_type": "code",
     }
 
-    async with httpx.AsyncClient(
-        headers=headers,
-        follow_redirects=True,
-        timeout=30.0
-    ) as client:
+    # 使用 curl_cffi 模拟 Chrome124 TLS 指纹
+    async with AsyncSession(impersonate="chrome124") as session:
 
-        print("Step 1: 访问 OAuth 授权页面获取 state...")
+        print("Step 1: 访问 searcade 首页建立 Cookie...")
+        r0 = await session.get("https://searcade.com/en/")
+        print(f"  状态码: {r0.status_code}")
+        print(f"  Cookies: {dict(session.cookies)}")
+
+        print("\nStep 2: 访问 OAuth 授权页获取 state...")
         authorize_url = f"https://userveria.com/authorize/?{urlencode(oauth_params)}"
-        resp = await client.get(authorize_url)
-        print(f"  状态码: {resp.status_code}")
-        print(f"  最终 URL: {resp.url}")
+        r1 = await session.get(authorize_url)
+        print(f"  状态码: {r1.status_code}")
+        print(f"  最终 URL: {r1.url}")
+        print(f"  响应片段: {r1.text[:300]}")
 
-        # 从 URL 中提取 state
-        state = parse_qs(urlparse(str(resp.url)).query).get("state", [None])[0]
+        # 提取 state
+        state = parse_qs(urlparse(str(r1.url)).query).get("state", [None])[0]
         print(f"  State: {state}")
 
-        print("\nStep 2: 调用 userveria 登录 API...")
-        login_payload = {
+        if r1.status_code == 403:
+            print("  ❌ 仍被 Cloudflare 拦截，尝试等待后重试...")
+            await asyncio.sleep(5)
+            r1 = await session.get(authorize_url)
+            print(f"  重试状态码: {r1.status_code}")
+            state = parse_qs(urlparse(str(r1.url)).query).get("state", [None])[0]
+
+        print("\nStep 3: 获取 userveria CSRF token...")
+        # 访问登录页面获取必要的 token
+        login_page_url = f"https://userveria.com/authorize/?{urlencode(oauth_params)}"
+        r_page = await session.get(login_page_url)
+        print(f"  页面状态码: {r_page.status_code}")
+
+        # 尝试获取 payload.json（Nuxt 应用的数据）
+        payload_url = f"https://userveria.com/authorize/_payload.json"
+        r_payload = await session.get(payload_url)
+        print(f"  Payload 状态码: {r_payload.status_code}")
+        if r_payload.status_code == 200:
+            print(f"  Payload: {r_payload.text[:500]}")
+
+        print("\nStep 4: 登录 userveria...")
+        login_headers = {
+            "Content-Type": "application/json",
+            "Origin": "https://userveria.com",
+            "Referer": authorize_url,
+        }
+
+        # 构建登录请求
+        login_data = {
             "email": email,
             "password": password,
         }
 
-        # 尝试 userveria 的登录接口
-        login_resp = await client.post(
+        # 尝试不同的登录端点
+        endpoints = [
             "https://userveria.com/api/auth/login",
-            json=login_payload,
-            headers={
-                **headers,
-                "Content-Type": "application/json",
-                "Referer": authorize_url,
-            }
-        )
-        print(f"  登录状态码: {login_resp.status_code}")
-        print(f"  登录响应: {login_resp.text[:500]}")
+            "https://userveria.com/api/auth/email",
+            "https://userveria.com/api/login",
+            "https://userveria.com/auth/login",
+        ]
 
-        if login_resp.status_code not in (200, 201, 302):
-            # 尝试其他可能的 API 路径
-            for api_path in [
-                "/api/auth/signin",
-                "/api/login",
-                "/api/v1/auth/login",
-                "/auth/login",
-            ]:
-                print(f"\n  尝试路径: {api_path}")
-                r = await client.post(
-                    f"https://userveria.com{api_path}",
-                    json=login_payload,
-                    headers={**headers, "Content-Type": "application/json"},
-                )
-                print(f"  状态码: {r.status_code}, 响应: {r.text[:200]}")
-                if r.status_code in (200, 201):
-                    login_resp = r
-                    break
-
-        print("\nStep 3: 完成 OAuth 授权回调...")
-        # 携带 state 完成授权
-        if state:
-            authorize_payload = {
-                "state": state,
-                **oauth_params,
-            }
-            auth_resp = await client.post(
-                "https://userveria.com/api/authorize",
-                json=authorize_payload,
-                headers={**headers, "Content-Type": "application/json"},
+        login_success = False
+        for endpoint in endpoints:
+            print(f"\n  尝试端点: {endpoint}")
+            r_login = await session.post(
+                endpoint,
+                json=login_data,
+                headers=login_headers,
             )
-            print(f"  授权状态码: {auth_resp.status_code}")
-            print(f"  授权响应: {auth_resp.text[:300]}")
+            print(f"  状态码: {r_login.status_code}")
+            print(f"  响应: {r_login.text[:300]}")
 
-        print("\nStep 4: 验证登录状态...")
-        check_resp = await client.get("https://searcade.com/en/admin/")
-        print(f"  Admin 页面状态码: {check_resp.status_code}")
-        print(f"  最终 URL: {check_resp.url}")
+            if r_login.status_code in (200, 201):
+                login_success = True
+                print(f"  ✅ 登录端点找到: {endpoint}")
+                break
 
-        if "/admin" in str(check_resp.url):
-            print("✅ 登录成功！已进入 Admin 后台")
+        print("\nStep 5: 完成 OAuth 授权并回调...")
+        if state:
+            # 授权
+            r_auth = await session.post(
+                f"https://userveria.com/api/authorize",
+                json={
+                    "state": state,
+                    **oauth_params,
+                },
+                headers=login_headers,
+            )
+            print(f"  授权状态码: {r_auth.status_code}")
+            print(f"  授权响应: {r_auth.text[:300]}")
+
+            # 如果返回了 redirect_uri，手动跟随
+            try:
+                auth_data = r_auth.json()
+                if "redirect_uri" in auth_data or "code" in auth_data:
+                    code = auth_data.get("code", "")
+                    callback_url = f"https://searcade.com/accounts/userveria/login/callback/?code={code}&state={state}"
+                    print(f"\n  回调 URL: {callback_url}")
+                    r_callback = await session.get(callback_url)
+                    print(f"  回调状态码: {r_callback.status_code}")
+                    print(f"  回调最终 URL: {r_callback.url}")
+            except Exception as e:
+                print(f"  解析授权响应失败: {e}")
+
+        print("\nStep 6: 验证登录状态...")
+        r_check = await session.get("https://searcade.com/en/admin/")
+        print(f"  状态码: {r_check.status_code}")
+        print(f"  最终 URL: {r_check.url}")
+        print(f"  Cookies: {dict(session.cookies)}")
+
+        # 正确判断是否登录成功
+        final_url = str(r_check.url)
+        if "/admin" in final_url and r_check.status_code == 200:
+            print("\n✅ 登录成功！已进入 Admin 后台")
+        elif "login" in final_url or r_check.status_code in (401, 403):
+            print("\n❌ 登录失败，被重定向到登录页面")
+        elif r_check.status_code == 404:
+            print("\n⚠️ Admin 路径 404，尝试其他路径...")
+            # 尝试其他 admin 路径
+            for admin_path in ["/admin/", "/en/admin/", "/dashboard/", "/en/dashboard/"]:
+                r_try = await session.get(f"https://searcade.com{admin_path}")
+                print(f"  {admin_path}: {r_try.status_code} -> {r_try.url}")
         else:
-            print(f"⚠️ 当前 URL: {check_resp.url}")
-            print("  需要查看日志进一步分析")
+            print(f"\n⚠️ 未知状态: {r_check.status_code} at {r_check.url}")
 
 if __name__ == "__main__":
     asyncio.run(run())
