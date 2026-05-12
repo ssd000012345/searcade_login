@@ -7,7 +7,7 @@ on:
 
 jobs:
   login_job:
-    runs-on: ubuntu-22.04  # ← 改用 22.04，包名完全兼容
+    runs-on: ubuntu-22.04
 
     steps:
       - name: 检出代码
@@ -29,7 +29,14 @@ jobs:
         env:
           SEARCADE_EMAIL: ${{ secrets.SEARCADE_EMAIL }}
           SEARCADE_PASSWORD: ${{ secrets.SEARCADE_PASSWORD }}
-        run: python main.py
+          # 有头模式需要虚拟显示器
+          DISPLAY: ':99'
+        run: |
+          # 启动虚拟显示器（支持 headless=False）
+          sudo apt-get install -y -qq xvfb
+          Xvfb :99 -screen 0 1280x720x24 &
+          sleep 2
+          python main.py
 
       - name: 保存截图到 Artifacts
         if: always()
@@ -38,6 +45,8 @@ jobs:
           name: searcade-login-results-${{ github.run_id }}
           path: |
             before_login.png
+            after_click_login.png
+            after_email.png
             after_login.png
             error_state.png
           retention-days: 7
