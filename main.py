@@ -1,8 +1,7 @@
 import os
 import asyncio
 from playwright.async_api import async_playwright
-# 正确的异步导入方式
-from playwright_stealth import stealth_async
+from playwright_stealth import stealth   # 修正：去掉 _async
 
 async def run():
     async with async_playwright() as p:
@@ -17,8 +16,8 @@ async def run():
         
         page = await context.new_page()
 
-        # 使用 stealth_async 抹除特征
-        await stealth_async(page)
+        # 使用 stealth 抹除特征（仍然是异步调用）
+        await stealth(page)
 
         # 1. 访问首页
         print("正在访问首页...")
@@ -44,7 +43,6 @@ async def run():
 
             # 4. 等待跳转回管理后台
             print("等待登录跳转...")
-            # 匹配包含 admin 的 URL
             await page.wait_for_url("**/admin**", timeout=30000)
             await page.wait_for_load_state("networkidle")
             
