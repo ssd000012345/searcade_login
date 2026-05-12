@@ -1,7 +1,7 @@
 import os
 import asyncio
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth   # 修正：去掉 _async
+from playwright_stealth import stealth   # 正确导入函数
 
 async def run():
     async with async_playwright() as p:
@@ -16,7 +16,7 @@ async def run():
         
         page = await context.new_page()
 
-        # 使用 stealth 抹除特征（仍然是异步调用）
+        # 正确调用 stealth（注意拼写）
         await stealth(page)
 
         # 1. 访问首页
