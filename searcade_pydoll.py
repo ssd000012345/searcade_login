@@ -108,7 +108,7 @@ async def manual_cf_click(tab, timeout=15):
     log.info("尝试手动完成 Cloudflare 验证（Shadow DOM 穿透点击）...")
     for i in range(timeout):
         body = await get_text(tab)
-        if "email" in body or "登录" in body or "请输入邮箱" in body or "用户中心" in body:
+        if "email" in body or "login" in body or "password" in body:
             log.info("✅ Cloudflare 验证已通过")
             return True
         try:
@@ -133,7 +133,7 @@ async def manual_cf_click(tab, timeout=15):
             log.info("已点击 Cloudflare checkbox，等待验证...")
             await asyncio.sleep(3)
             body2 = await get_text(tab)
-            if "email" in body2 or "登录" in body2 or "请输入邮箱" in body2 or "用户中心" in body2:
+            if "email" in body2 or "login" in body2 or "password" in body2:
                 log.info("✅ 点击后验证通过")
                 return True
         except Exception as e:
@@ -165,7 +165,7 @@ async def fill_captcha(tab):
             pass
         if not cap_img:
             try:
-                cap_img = await tab.find(tag_name="img", alt="验证码", timeout=5)
+                cap_img = await tab.find(tag_name="img", alt="captcha", timeout=5)
             except:
                 pass
         if cap_img:
@@ -181,7 +181,7 @@ async def fill_captcha(tab):
                         var input =
                             document.querySelector('#captcha_allow_login_email_captcha') ||
                             document.querySelector('input[name="captcha"]') ||
-                            document.querySelector('input[placeholder*="验证码"]');
+                            document.querySelector('input[placeholder*="captcha"]');
                         if (input) {{
                             input.focus();
                             input.value = '{code}';
@@ -194,7 +194,7 @@ async def fill_captcha(tab):
         await asyncio.sleep(1)
     return ""
 
-# ========== 浏览器创建（复用原项目） ==========
+# ========== 浏览器创建 ==========
 def _find_chromium() -> str | None:
     candidates = [
         "/usr/bin/chromium-browser",
@@ -218,7 +218,7 @@ def _find_chromium() -> str | None:
 
 async def create_browser():
     opts = ChromiumOptions()
-    opts.headless = False  # 配合 xvfb 使用
+    opts.headless = False
     path = _find_chromium()
     if path:
         opts.binary_location = path
@@ -232,8 +232,6 @@ async def create_browser():
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--exclude-switches=enable-automation")
     opts.add_argument("--disable-infobars")
-    # 代理已注释（如需代理请取消注释并配置 socks5）
-    # opts.add_argument("--proxy-server=socks5://127.0.0.1:10808")
     opts.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -255,13 +253,13 @@ async def create_browser():
             },
         },
         "autofill": {"enabled": False},
-        "intl": {"accept_languages": "zh-CN,zh,en-US,en"},
+        # 移除了中文字体设置，仅保留英文
+        "intl": {"accept_languages": "en-US,en"},
     }
 
     browser = await Chrome(options=opts).__aenter__()
     tab = await browser.start()
 
-    # 指纹伪装
     try:
         await tab.execute_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -271,15 +269,13 @@ async def create_browser():
 
     return browser, tab
 
-# ========== Searcade 登录流程（两步登录） ==========
+# ========== Searcade 登录流程 ==========
 async def login_searcade(browser, tab):
     log.info("开始登录 Searcade...")
 
-    # 1. 访问首页，处理可能的 CF
     await ensure_cf_passed(tab, BASE_URL)
     await take_screenshot(browser, tab, "01_home")
 
-    # 2. 点击 Login 按钮
     log.info("点击登录按钮")
     try:
         login_btn = await tab.find(tag_name="a", text="Login", timeout=10)
@@ -288,18 +284,14 @@ async def login_searcade(browser, tab):
     await login_btn.click()
     await asyncio.sleep(2)
 
-    # 3. 等待跳转到 userveria OAuth 页面
     if not await wait_for_url_contains(tab, "userveria.com", timeout=15):
         log.warning("未跳转到 userveria，当前 URL: " + await get_url(tab))
-        # 若未跳转，尝试直接构造 OAuth URL
         oauth_url = f"{USERVERIA_AUTH_URL}?client_id=8305d2e2-e91f-4deb-8909-f669259bc23f&redirect_uri={REDIRECT_URI}&scope=profile&response_type=code"
         await tab.go_to(oauth_url)
         await asyncio.sleep(2)
 
-    # 4. 处理 OAuth 页面上的 CF 验证
     await ensure_cf_passed(tab, await get_url(tab))
 
-    # 5. 填写邮箱并点击 "Continue with email"
     log.info("填写邮箱并点击 Continue with email")
     try:
         email_input = await tab.find(tag_name="input", name="email", timeout=10)
@@ -316,7 +308,6 @@ async def login_searcade(browser, tab):
     await continue_btn.click()
     log.info("已点击 Continue with email")
 
-    # 6. 等待密码输入框出现（可能伴随新的 CF 挑战）
     await asyncio.sleep(2)
     await ensure_cf_passed(tab, await get_url(tab))
 
@@ -329,7 +320,6 @@ async def login_searcade(browser, tab):
     await pass_input.type_text(PASSWORD, humanize=True)
     await human_delay()
 
-    # 7. 提交登录
     log.info("点击登录提交")
     try:
         submit_btn = await tab.find(tag_name="button", text="Log in", timeout=10)
@@ -337,7 +327,6 @@ async def login_searcade(browser, tab):
         submit_btn = await tab.find(tag_name="button", type="submit", timeout=10)
     await submit_btn.click()
 
-    # 8. 等待重定向回 searcade.com
     if await wait_for_url_contains(tab, "searcade.com", timeout=20):
         log.info("✅ 成功回调至 Searcade")
     else:
@@ -346,7 +335,6 @@ async def login_searcade(browser, tab):
     await asyncio.sleep(3)
     await take_screenshot(browser, tab, "02_logged_in")
 
-    # 9. 验证登录成功
     body = await get_text(tab)
     if "logout" in body.lower() or "sign out" in body.lower() or "dashboard" in body.lower():
         log.info("✅ 登录验证成功")
