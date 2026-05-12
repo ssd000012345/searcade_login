@@ -19,13 +19,12 @@ EMAIL = os.environ["SEARCADE_EMAIL"]
 PASSWORD = os.environ["SEARCADE_PASSWORD"]
 BASE_URL = "https://searcade.com/en/"
 LOGIN_URL = "https://searcade.com/en/"
-USERVERIA_AUTH_URL = "https://searcade.userveria.com/api/v1/oauth/authorize"
+USERVERIA_AUTH_URL = "https://userveria.com/authorize/"
 REDIRECT_URI = "https://searcade.com/accounts/userveria/login/callback/"
 
 SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
-# WxPusher 推送（可选）
 WXPUSHER_TOKEN = os.environ.get("WXPUSHER_TOKEN", "")
 WXPUSHER_UID   = os.environ.get("WXPUSHER_UID", "")
 
@@ -156,7 +155,7 @@ async def ensure_cf_passed(tab, url, timeout=15):
         await asyncio.sleep(1)
     return await manual_cf_click(tab)
 
-# ========== 验证码识别（原样保留，以备不时之需） ==========
+# ========== 验证码识别（备用） ==========
 async def fill_captcha(tab):
     for _ in range(3):
         cap_img = None
@@ -195,7 +194,7 @@ async def fill_captcha(tab):
         await asyncio.sleep(1)
     return ""
 
-# ========== 浏览器创建（复用原项目，去除代理） ==========
+# ========== 浏览器创建（复用原项目） ==========
 def _find_chromium() -> str | None:
     candidates = [
         "/usr/bin/chromium-browser",
@@ -272,7 +271,7 @@ async def create_browser():
 
     return browser, tab
 
-# ========== Searcade 登录流程 ==========
+# ========== Searcade 登录流程（两步登录） ==========
 async def login_searcade(browser, tab):
     log.info("开始登录 Searcade...")
 
@@ -297,11 +296,11 @@ async def login_searcade(browser, tab):
         await tab.go_to(oauth_url)
         await asyncio.sleep(2)
 
-    # 4. 处理 OAuth 页面上的 CF 验证（关键）
+    # 4. 处理 OAuth 页面上的 CF 验证
     await ensure_cf_passed(tab, await get_url(tab))
 
-    # 5. 填写邮箱和密码
-    log.info("填写邮箱密码")
+    # 5. 填写邮箱并点击 "Continue with email"
+    log.info("填写邮箱并点击 Continue with email")
     try:
         email_input = await tab.find(tag_name="input", name="email", timeout=10)
     except:
@@ -311,24 +310,34 @@ async def login_searcade(browser, tab):
     await human_delay()
 
     try:
-        pass_input = await tab.find(tag_name="input", name="password", timeout=10)
+        continue_btn = await tab.find(tag_name="button", text="Continue with email", timeout=10)
     except:
-        pass_input = await tab.find(tag_name="input", type="password", timeout=10)
+        continue_btn = await tab.find(tag_name="button", text="Continue", timeout=10)
+    await continue_btn.click()
+    log.info("已点击 Continue with email")
+
+    # 6. 等待密码输入框出现（可能伴随新的 CF 挑战）
+    await asyncio.sleep(2)
+    await ensure_cf_passed(tab, await get_url(tab))
+
+    log.info("等待密码输入框")
+    try:
+        pass_input = await tab.find(tag_name="input", name="password", timeout=15)
+    except:
+        pass_input = await tab.find(tag_name="input", type="password", timeout=15)
     await pass_input.click()
     await pass_input.type_text(PASSWORD, humanize=True)
+    await human_delay()
 
-    # 可选：处理验证码（searcade OAuth 一般无验证码，但保留调用）
-    # captcha = await fill_captcha(tab)
-
-    # 6. 提交登录表单
-    log.info("提交登录表单")
+    # 7. 提交登录
+    log.info("点击登录提交")
     try:
         submit_btn = await tab.find(tag_name="button", text="Log in", timeout=10)
     except:
         submit_btn = await tab.find(tag_name="button", type="submit", timeout=10)
     await submit_btn.click()
 
-    # 7. 等待重定向回 searcade.com
+    # 8. 等待重定向回 searcade.com
     if await wait_for_url_contains(tab, "searcade.com", timeout=20):
         log.info("✅ 成功回调至 Searcade")
     else:
@@ -337,7 +346,7 @@ async def login_searcade(browser, tab):
     await asyncio.sleep(3)
     await take_screenshot(browser, tab, "02_logged_in")
 
-    # 8. 检查登录是否成功（查找退出按钮或用户菜单）
+    # 9. 验证登录成功
     body = await get_text(tab)
     if "logout" in body.lower() or "sign out" in body.lower() or "dashboard" in body.lower():
         log.info("✅ 登录验证成功")
