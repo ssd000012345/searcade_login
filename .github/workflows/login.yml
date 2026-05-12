@@ -18,36 +18,13 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 安装 Python 依赖和 Playwright
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install "playwright==1.40.0"
-          pip install "playwright-stealth==1.0.6"
-          playwright install chromium --with-deps
+          pip install httpx
 
       - name: 执行登录脚本
         env:
           SEARCADE_EMAIL: ${{ secrets.SEARCADE_EMAIL }}
           SEARCADE_PASSWORD: ${{ secrets.SEARCADE_PASSWORD }}
-          # 有头模式需要虚拟显示器
-          DISPLAY: ':99'
-        run: |
-          # 启动虚拟显示器（支持 headless=False）
-          sudo apt-get install -y -qq xvfb
-          Xvfb :99 -screen 0 1280x720x24 &
-          sleep 2
-          python main.py
-
-      - name: 保存截图到 Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: searcade-login-results-${{ github.run_id }}
-          path: |
-            before_login.png
-            after_click_login.png
-            after_email.png
-            after_login.png
-            error_state.png
-          retention-days: 7
-          if-no-files-found: ignore
+        run: python main.py
