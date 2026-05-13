@@ -451,13 +451,71 @@ async def login_searcade(browser, tab):
     await asyncio.sleep(3)
     await take_screenshot(browser, tab, "02_logged_in")
 
+    # 登录成功判断：页面出现 Successfully signed in 或其他登录后标识
     body = await get_text(tab)
-    if "logout" in body.lower() or "sign out" in body.lower() or "dashboard" in body.lower():
-        log.info("✅ 登录验证成功")
-        return True
-    else:
+    signed_in = (
+        "successfully signed in" in body.lower()
+        or "your servers" in body.lower()
+        or "logout" in body.lower()
+        or "sign out" in body.lower()
+        or "dashboard" in body.lower()
+    )
+    if not signed_in:
         log.error("❌ 登录后未找到成功标识")
         return False
+
+    log.info("✅ 登录验证成功，准备进入服务器页面")
+
+    # ========== 进入服务器 ==========
+    log.info("滚动页面，寻找服务器卡片...")
+    await tab.execute_script("window.scrollBy(0, 400);")
+    await asyncio.sleep(1)
+
+    # 点击服务器卡片（href 含 /servers/ 的链接）
+    server_clicked = await tab.execute_script("""
+    (function() {
+        var links = Array.from(document.querySelectorAll('a[href]'));
+        var srv = links.find(function(a) {
+            return /\/servers\/|admin\/servers/.test(a.href);
+        });
+        if (srv) { srv.click(); return srv.href; }
+        return null;
+    })()
+    """)
+
+    clicked_href = None
+    if isinstance(server_clicked, dict):
+        clicked_href = server_clicked.get("result", {}).get("result", {}).get("value")
+    elif isinstance(server_clicked, str):
+        clicked_href = server_clicked
+
+    if clicked_href:
+        log.info(f"点击服务器卡片: {clicked_href}")
+    else:
+        log.warning("未找到 /servers/ 链接，尝试点击第一个卡片...")
+        await tab.execute_script("""
+        (function() {
+            var card = document.querySelector('a.card, a[class*=card], main a, .servers a');
+            if (card) card.click();
+        })()
+        """)
+
+    # 等待跳转到服务器管理页
+    log.info("等待服务器管理页面加载...")
+    if await wait_for_url_contains(tab, "/servers/", timeout=15):
+        log.info("✅ 已进入服务器管理页面，URL: " + await get_url(tab))
+    else:
+        log.warning("未检测到 /servers/ URL，当前: " + await get_url(tab))
+
+    await asyncio.sleep(2)
+    await take_screenshot(browser, tab, "03_server_manage")
+
+    body2 = await get_text(tab)
+    if "manage" in body2.lower():
+        log.info("✅ 服务器 Manage 页面加载成功")
+    else:
+        log.warning("⚠️ 未找到 Manage 字样，请检查截图 03_server_manage")
+    return True
 
 # ========== 主流程 ==========
 async def main():
