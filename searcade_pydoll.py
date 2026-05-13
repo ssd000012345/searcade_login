@@ -10,6 +10,7 @@ from datetime import datetime
 from pydoll.browser.chromium import Chrome
 from pydoll.browser.options import ChromiumOptions
 import ddddocr
+from PIL import Image, ImageFilter  # 新增用于模糊处理
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -57,12 +58,75 @@ def wxpush(content: str):
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
 # ========== 辅助函数 ==========
+async def blur_sensitive_areas(tab, image_path):
+    """对截图中敏感区域进行高斯模糊处理"""
+    try:
+        # 获取页面中敏感元素的位置
+        elements_info = await tab.execute_script("""
+        (function() {
+            const selectors = [
+                'input[type="email"]', 'input[name="email"]',
+                'input[type="password"]', 'input[name="password"]',
+                // 可能包含用户邮箱的文本区域（例如欢迎语中的邮箱）
+                'div:contains("gmail.com")', 'span:contains("gmail.com")',
+                'p:contains("gmail.com")', 'div:contains("@")'
+            ];
+            const rects = [];
+            for (let sel of selectors) {
+                let el = document.querySelector(sel);
+                if (el && el.getBoundingClientRect) {
+                    let rect = el.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        rects.push({x: rect.x, y: rect.y, width: rect.width, height: rect.height});
+                    }
+                }
+            }
+            // 也查找所有包含 @ 的文本节点（粗略）
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+                acceptNode: function(node) {
+                    if (node.textContent && node.textContent.includes('@')) return NodeFilter.FILTER_ACCEPT;
+                    return NodeFilter.FILTER_SKIP;
+                }
+            });
+            while (walker.nextNode()) {
+                let range = document.createRange();
+                range.selectNodeContents(walker.currentNode);
+                let rect = range.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    rects.push({x: rect.x, y: rect.y, width: rect.width, height: rect.height});
+                }
+            }
+            return rects;
+        })()
+        """)
+        if not isinstance(elements_info, list):
+            elements_info = []
+        # 打开图片并模糊
+        img = Image.open(image_path)
+        for rect in elements_info:
+            x = int(rect.get('x', 0))
+            y = int(rect.get('y', 0))
+            w = int(rect.get('width', 0))
+            h = int(rect.get('height', 0))
+            if w > 0 and h > 0:
+                # 扩展模糊区域边界
+                box = (max(0, x-5), max(0, y-5), min(img.width, x+w+5), min(img.height, y+h+5))
+                crop = img.crop(box)
+                blurred = crop.filter(ImageFilter.GaussianBlur(radius=15))
+                img.paste(blurred, box)
+        img.save(image_path)
+        log.info(f"🔒 已对截图敏感信息进行模糊处理: {image_path}")
+    except Exception as e:
+        log.warning(f"模糊处理失败: {e}")
+
 async def take_screenshot(browser, tab, name):
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
         await tab.take_screenshot(path=path)
-        log.info(f"📸 截图: {path}")
+        # 对截图进行敏感信息模糊
+        await blur_sensitive_areas(tab, path)
+        log.info(f"📸 截图已保存并模糊处理: {path}")
     except Exception as e:
         log.warning(f"截图失败: {e}")
 
@@ -378,10 +442,8 @@ async def login_searcade(browser, tab):
     await human_delay()
 
     log.info("点击 Continue with email 按钮")
-    # 核心修复：改用 JS innerText 匹配，绕过 XPath text() 对含 SVG 按钮的匹配失败问题
     matched = await js_click_button_by_text(tab, "Continue with email", "Continue")
     if not matched:
-        # 再降级：按 data-slot 属性或 type=submit 点击
         fallback = await tab.execute_script("""
         (function() {
             var btn = document.querySelector('button[type="submit"]') ||
@@ -395,10 +457,6 @@ async def login_searcade(browser, tab):
             raise Exception("找不到 Continue with email 按钮")
         log.info("已通过 fallback 点击提交按钮")
 
-    # ⚠️ 注意：点击 Continue 后页面会自动跳转到密码步骤，
-    # 绝对不能在此处调用 ensure_cf_passed(tab, await get_url(tab))，
-    # 否则会把当前 URL（邮箱步骤）重新导航一次，把密码页面冲掉！
-    # 只需等待密码框自然出现即可。
     log.info("等待页面跳转到密码输入步骤...")
     await asyncio.sleep(2)
 
@@ -444,7 +502,6 @@ async def login_searcade(browser, tab):
         log.info("已通过 fallback 点击登录按钮")
 
     # 等待成功回调到 searcade.com，并且页面内容也加载完成
-    # 不能只靠 URL 跳转，还要等页面渲染出登录后内容再读取
     log.info("等待回调并确认页面加载完成...")
     signed_in = False
     for _ in range(20):  # 最多等 10 秒
@@ -467,7 +524,6 @@ async def login_searcade(browser, tab):
     await take_screenshot(browser, tab, "02_logged_in")
 
     if not signed_in:
-        # 最后兜底：只要 URL 在 searcade.com/en/admin 就算成功
         url = await get_url(tab)
         if "searcade.com/en/admin" in url or "searcade.com/en/" in url:
             log.info("✅ URL 判断登录成功: " + url)
@@ -488,7 +544,7 @@ async def login_searcade(browser, tab):
     (function() {
         var links = Array.from(document.querySelectorAll('a[href]'));
         var srv = links.find(function(a) {
-            return /\/servers\/|admin\/servers/.test(a.href);
+            return /\\/servers\\/|admin\\/servers/.test(a.href);
         });
         if (srv) { srv.click(); return srv.href; }
         return null;
@@ -512,7 +568,6 @@ async def login_searcade(browser, tab):
         })()
         """)
 
-    # 等待跳转到服务器管理页
     log.info("等待服务器管理页面加载...")
     if await wait_for_url_contains(tab, "/servers/", timeout=15):
         log.info("✅ 已进入服务器管理页面，URL: " + await get_url(tab))
