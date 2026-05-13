@@ -57,15 +57,43 @@ def wxpush(content: str):
 
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
+# ========== 邮箱变形生成 ==========
+
+def get_email_variants(email: str) -> list[str]:
+    """生成邮箱所有可能的显示变形（按长度倒序，避免子串污染）"""
+    if not email:
+        return []
+    username = email.split("@")[0] if "@" in email else email
+    domain   = email.split("@")[1] if "@" in email else ""
+
+    variants = [
+        email,                                              # ssd000012345@gmail.com
+        email.replace("@", "at").replace(".", "-"),         # ssd000012345atgmail-com
+        email.replace("@", "_at_").replace(".", "_"),       # ssd000012345_at_gmail_com
+        email.replace("@", "[at]").replace(".", "[dot]"),
+        email.replace("@", " at ").replace(".", " dot "),
+        username,                                           # ssd000012345
+    ]
+    if domain:
+        variants.append(domain)
+        variants.append(domain.replace(".", "-"))
+
+    # 去重 + 按长度倒序（先替换长的）
+    return sorted(set(v for v in variants if v), key=len, reverse=True)
+
 # ========== 敏感信息处理 ==========
 
 async def mask_sensitive_inputs(tab):
     """
-    在敏感 input 上叠加固定覆盖层，截图时视觉上完全遮住内容。
-    同时替换页面文本节点中出现的邮箱地址。
+    1. 在敏感 input 上叠加固定覆盖层
+    2. 替换页面文本节点中所有出现的邮箱（包括变形版本）
     """
-    script = """
-    (function() {
+    variants      = get_email_variants(EMAIL)
+    variants_json = json.dumps(variants)
+
+    script = f"""
+    (function() {{
+        // ========= 1. 输入框遮罩 =========
         const selectors = [
             'input[type="email"]',
             'input[name="email"]',
@@ -74,7 +102,7 @@ async def mask_sensitive_inputs(tab):
             'input[type="text"]'
         ];
 
-        for (let sel of selectors) {
+        for (let sel of selectors) {{
             let el = document.querySelector(sel);
             if (!el) continue;
             let rect = el.getBoundingClientRect();
@@ -85,10 +113,10 @@ async def mask_sensitive_inputs(tab):
             let overlay = document.createElement('div');
             overlay.style.cssText = `
                 position: fixed;
-                left: ${rect.left}px;
-                top: ${rect.top}px;
-                width: ${rect.width}px;
-                height: ${rect.height}px;
+                left: ${{rect.left}}px;
+                top: ${{rect.top}}px;
+                width: ${{rect.width}}px;
+                height: ${{rect.height}}px;
                 background: #333333;
                 z-index: 999999;
                 pointer-events: none;
@@ -96,44 +124,63 @@ async def mask_sensitive_inputs(tab):
             `;
             overlay.setAttribute('data-mask', 'sensitive');
             document.body.appendChild(overlay);
-        }
+        }}
 
-        // 替换文本节点中出现的邮箱
-        const emailInputs = document.querySelectorAll(
-            'input[type="email"], input[name="email"]'
+        // ========= 2. 文本节点替换（含变形版本） =========
+        const variants = {variants_json};
+
+        function escapeRegex(s) {{
+            return s.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&');
+        }}
+
+        const walker = document.createTreeWalker(
+            document.body, NodeFilter.SHOW_TEXT
         );
-        let emailVal = '';
-        emailInputs.forEach(inp => { if (inp.value) emailVal = inp.value; });
+        const nodes = [];
+        while (walker.nextNode()) nodes.push(walker.currentNode);
 
-        if (emailVal) {
-            const escaped = emailVal.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
-            const emailRegex = new RegExp(escaped, 'gi');
-            const walker = document.createTreeWalker(
-                document.body, NodeFilter.SHOW_TEXT
-            );
-            const nodes = [];
-            while (walker.nextNode()) nodes.push(walker.currentNode);
-            nodes.forEach(node => {
-                if (emailRegex.test(node.textContent)) {
-                    node.textContent = node.textContent.replace(
-                        emailRegex, '***@***.***'
-                    );
-                }
-            });
-        }
+        let replacedCount = 0;
+        nodes.forEach(node => {{
+            let text    = node.textContent;
+            let changed = false;
+            for (let v of variants) {{
+                if (!v) continue;
+                let regex = new RegExp(escapeRegex(v), 'gi');
+                if (regex.test(text)) {{
+                    text    = text.replace(regex, '***');
+                    changed = true;
+                }}
+            }}
+            if (changed) {{
+                node.textContent = text;
+                replacedCount++;
+            }}
+        }});
 
-        return true;
-    })()
+        return {{
+            overlays: document.querySelectorAll('[data-mask="sensitive"]').length,
+            replaced: replacedCount
+        }};
+    }})()
     """
+
     try:
-        await tab.execute_script(script)
-        log.info("🔒 已在敏感区域叠加遮罩层")
+        result = await tab.execute_script(script)
+        if isinstance(result, dict) and "result" in result:
+            data = result.get("result", {}).get("result", {}).get("value", {})
+        else:
+            data = result
+        if isinstance(data, dict):
+            log.info(f"🔒 遮罩: {data.get('overlays', 0)} 个输入框, "
+                     f"替换 {data.get('replaced', 0)} 处文本")
+        else:
+            log.info("🔒 已应用敏感信息遮罩")
     except Exception as e:
-        log.warning(f"遮罩叠加失败: {e}")
+        log.warning(f"遮罩叠加失败: {e}", exc_info=True)
 
 
 async def unmask_sensitive_inputs(tab):
-    """截图完成后移除所有遮罩层，恢复页面正常交互"""
+    """截图完成后移除所有遮罩层（注意：文本节点替换不可逆，但不影响功能）"""
     script = """
     (function() {
         document.querySelectorAll('[data-mask="sensitive"]').forEach(el => el.remove());
@@ -150,46 +197,76 @@ async def unmask_sensitive_inputs(tab):
 
 async def blur_sensitive_areas(tab, image_path):
     """
-    截图后用 PIL 对敏感区域进行黑色填充（二次保险）。
-    修复了设备像素比（DPR）导致的坐标偏移问题。
+    PIL 二次保险：
+    1. 对 input 框区域填充黑色
+    2. 对仍包含敏感字符串的叶子节点元素区域填充黑色（防 JS 替换遗漏 / 框架重渲染）
     """
     try:
-        result = await tab.execute_script("""
-        (function() {
-            const dpr = window.devicePixelRatio || 1;
-            const selectors = [
-                'input[type="email"]',
-                'input[name="email"]',
-                'input[type="password"]',
-                'input[name="password"]'
-            ];
-            const rects = [];
-            for (let sel of selectors) {
-                let el = document.querySelector(sel);
-                if (el) {
-                    let rect = el.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
-                        rects.push({
-                            x: Math.floor(rect.x * dpr),
-                            y: Math.floor(rect.y * dpr),
-                            width: Math.ceil(rect.width * dpr),
-                            height: Math.ceil(rect.height * dpr)
-                        });
-                    }
-                }
-            }
-            return { rects: rects, dpr: dpr };
-        })()
-        """)
+        variants      = get_email_variants(EMAIL)
+        variants_json = json.dumps(variants)
 
-        # 兼容 pydoll 不同版本的返回格式
+        script = f"""
+        (function() {{
+            const dpr   = window.devicePixelRatio || 1;
+            const rects = [];
+
+            // 1. 输入框
+            const inputSelectors = [
+                'input[type="email"]', 'input[name="email"]',
+                'input[type="password"]', 'input[name="password"]'
+            ];
+            for (let sel of inputSelectors) {{
+                let el = document.querySelector(sel);
+                if (el) {{
+                    let r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {{
+                        rects.push({{
+                            x:      Math.floor(r.x      * dpr),
+                            y:      Math.floor(r.y      * dpr),
+                            width:  Math.ceil (r.width  * dpr),
+                            height: Math.ceil (r.height * dpr),
+                            type:   'input'
+                        }});
+                    }}
+                }}
+            }}
+
+            // 2. 含敏感文本的叶子节点
+            const variants = {variants_json};
+            const all      = document.querySelectorAll('body *');
+            for (let el of all) {{
+                if (el.children.length > 0) continue;  // 仅叶子节点
+                let txt = el.textContent || '';
+                if (!txt) continue;
+                for (let v of variants) {{
+                    if (v && txt.toLowerCase().includes(v.toLowerCase())) {{
+                        let r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0 && r.height < 200) {{
+                            rects.push({{
+                                x:      Math.floor(r.x      * dpr),
+                                y:      Math.floor(r.y      * dpr),
+                                width:  Math.ceil (r.width  * dpr),
+                                height: Math.ceil (r.height * dpr),
+                                type:   'text'
+                            }});
+                        }}
+                        break;
+                    }}
+                }}
+            }}
+
+            return {{ rects: rects, dpr: dpr }};
+        }})()
+        """
+
+        result = await tab.execute_script(script)
         if isinstance(result, dict) and "result" in result:
             data = result.get("result", {}).get("result", {}).get("value", {})
         else:
             data = result
 
         if not isinstance(data, dict):
-            log.warning(f"blur_sensitive_areas: 返回格式异常 type={type(data)}")
+            log.warning(f"blur_sensitive_areas: 返回格式异常 {type(data)}")
             return
 
         rects = data.get("rects", [])
@@ -199,20 +276,21 @@ async def blur_sensitive_areas(tab, image_path):
         if not rects:
             return
 
-        img = Image.open(image_path)
+        img          = Image.open(image_path)
         img_w, img_h = img.size
-        draw = ImageDraw.Draw(img)
+        draw         = ImageDraw.Draw(img)
 
         for rect in rects:
             x = int(rect.get('x', 0))
             y = int(rect.get('y', 0))
             w = int(rect.get('width', 0))
             h = int(rect.get('height', 0))
+            t = rect.get('type', '')
 
             if w <= 0 or h <= 0:
                 continue
 
-            padding = 8
+            padding = 4
             box = (
                 max(0,     x - padding),
                 max(0,     y - padding),
@@ -220,7 +298,7 @@ async def blur_sensitive_areas(tab, image_path):
                 min(img_h, y + h + padding),
             )
             draw.rectangle(box, fill=(40, 40, 40))
-            log.info(f"  已填充区域: {box}")
+            log.info(f"  [{t}] 已填充: {box}")
 
         img.save(image_path)
         log.info(f"🔒 PIL 二次打码完成: {image_path}")
@@ -232,10 +310,10 @@ async def blur_sensitive_areas(tab, image_path):
 async def take_screenshot(browser, tab, name):
     """
     安全截图完整流程：
-    1. JS 遮罩覆盖敏感输入框（视觉层）
-    2. 等待浏览器渲染遮罩
+    1. JS 遮罩覆盖敏感输入框 + 文本替换
+    2. 等待浏览器渲染
     3. 截图
-    4. PIL 黑色填充二次打码（坐标兜底）
+    4. PIL 二次打码（兜底）
     5. 移除遮罩，恢复页面
     """
     path = None
@@ -243,24 +321,18 @@ async def take_screenshot(browser, tab, name):
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
 
-        # 步骤1: JS 遮罩
         await mask_sensitive_inputs(tab)
-
-        # 步骤2: 等待一帧渲染（遮罩是 DOM 元素，需要浏览器渲染）
         await asyncio.sleep(0.8)
 
-        # 步骤3: 截图
         await tab.take_screenshot(path=path)
         log.info(f"📸 原始截图已保存: {path}")
 
-        # 步骤4: PIL 二次打码
         await blur_sensitive_areas(tab, path)
 
     except Exception as e:
         log.warning(f"截图失败: {e}", exc_info=True)
 
     finally:
-        # 步骤5: 无论成功与否都移除遮罩
         try:
             await unmask_sensitive_inputs(tab)
         except Exception as e:
@@ -427,10 +499,10 @@ async def fill_captcha(tab):
         if cap_img:
             src = cap_img.get_attribute("src")
             if src and src.startswith("data:image"):
-                b64      = src.split(",", 1)[1]
+                b64       = src.split(",", 1)[1]
                 img_bytes = base64.b64decode(b64)
-                raw      = ocr.classification(img_bytes)
-                code     = re.sub(r'[^0-9]', '', raw)
+                raw       = ocr.classification(img_bytes)
+                code      = re.sub(r'[^0-9]', '', raw)
                 log.info(f"识别验证码: {code}")
                 await tab.execute_script(f"""
                     (function() {{
@@ -736,7 +808,7 @@ async def main():
     browser, tab = None, None
     try:
         browser, tab = await create_browser()
-        success = await login_searcade(browser, tab)
+        success      = await login_searcade(browser, tab)
         if success:
             wxpush("✅ Searcade 自动登录成功")
         else:
