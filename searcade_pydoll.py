@@ -443,26 +443,38 @@ async def login_searcade(browser, tab):
             raise Exception("找不到登录提交按钮")
         log.info("已通过 fallback 点击登录按钮")
 
-    if await wait_for_url_contains(tab, "searcade.com", timeout=20):
-        log.info("✅ 成功回调至 Searcade")
-    else:
-        log.warning("未检测到回调，当前 URL: " + await get_url(tab))
+    # 等待成功回调到 searcade.com，并且页面内容也加载完成
+    # 不能只靠 URL 跳转，还要等页面渲染出登录后内容再读取
+    log.info("等待回调并确认页面加载完成...")
+    signed_in = False
+    for _ in range(20):  # 最多等 10 秒
+        url = await get_url(tab)
+        if "searcade.com" in url and "userveria" not in url:
+            body = await get_text(tab)
+            if (
+                "successfully signed in" in body.lower()
+                or "your servers" in body.lower()
+                or "logout" in body.lower()
+                or "sign out" in body.lower()
+                or "dashboard" in body.lower()
+                or "welcome back" in body.lower() and "searcade" in url
+            ):
+                signed_in = True
+                log.info("✅ 登录验证成功，当前 URL: " + url)
+                break
+        await asyncio.sleep(0.5)
 
-    await asyncio.sleep(3)
     await take_screenshot(browser, tab, "02_logged_in")
 
-    # 登录成功判断：页面出现 Successfully signed in 或其他登录后标识
-    body = await get_text(tab)
-    signed_in = (
-        "successfully signed in" in body.lower()
-        or "your servers" in body.lower()
-        or "logout" in body.lower()
-        or "sign out" in body.lower()
-        or "dashboard" in body.lower()
-    )
     if not signed_in:
-        log.error("❌ 登录后未找到成功标识")
-        return False
+        # 最后兜底：只要 URL 在 searcade.com/en/admin 就算成功
+        url = await get_url(tab)
+        if "searcade.com/en/admin" in url or "searcade.com/en/" in url:
+            log.info("✅ URL 判断登录成功: " + url)
+            signed_in = True
+        else:
+            log.error("❌ 登录后未找到成功标识，URL: " + url)
+            return False
 
     log.info("✅ 登录验证成功，准备进入服务器页面")
 
