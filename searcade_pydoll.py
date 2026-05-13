@@ -395,8 +395,12 @@ async def login_searcade(browser, tab):
             raise Exception("找不到 Continue with email 按钮")
         log.info("已通过 fallback 点击提交按钮")
 
+    # ⚠️ 注意：点击 Continue 后页面会自动跳转到密码步骤，
+    # 绝对不能在此处调用 ensure_cf_passed(tab, await get_url(tab))，
+    # 否则会把当前 URL（邮箱步骤）重新导航一次，把密码页面冲掉！
+    # 只需等待密码框自然出现即可。
+    log.info("等待页面跳转到密码输入步骤...")
     await asyncio.sleep(2)
-    await ensure_cf_passed(tab, await get_url(tab))
 
     log.info("等待密码输入框")
     pass_filled = False
