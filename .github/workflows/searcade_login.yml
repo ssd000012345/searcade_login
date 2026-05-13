@@ -19,15 +19,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 安装系统依赖 (Chromium + ffmpeg + xvfb)
+      - name: 安装系统依赖 (Chromium + xvfb)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq chromium-browser xvfb ffmpeg curl unzip
+          sudo apt-get install -y -qq chromium-browser xvfb curl unzip
 
       - name: 安装 Python 依赖
         run: pip install -r requirements.txt
 
-      - name: 运行脚本 (带 xvfb 和录屏)
+      - name: 运行脚本 (使用 xvfb)
         env:
           SEARCADE_EMAIL: ${{ secrets.SEARCADE_EMAIL }}
           SEARCADE_PASSWORD: ${{ secrets.SEARCADE_PASSWORD }}
@@ -38,24 +38,16 @@ jobs:
           export DISPLAY=:99
           Xvfb :99 -screen 0 1280x720x24 +extension RANDR &
           sleep 1
-          ffmpeg -f x11grab -video_size 1280x720 -i :99 \
-            -codec:v libx264 -preset ultrafast -crf 30 -t 300 \
-            -movflags +faststart /tmp/recording.mp4 &
-          RECORD_PID=$!
-          sleep 1
           timeout 285 python searcade_pydoll.py || echo "脚本退出码: $?"
           echo "=== 截图目录内容 ==="
           ls -la ./screenshots/ || echo "截图目录不存在"
-          kill $RECORD_PID 2>/dev/null || true
-          wait $RECORD_PID 2>/dev/null || true
           pkill Xvfb 2>/dev/null || true
 
-      - name: 上传截图和录屏
+      - name: 上传截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: searcade-login-debug
           path: |
             ./screenshots/*.png
-            /tmp/recording.mp4
           retention-days: 7
