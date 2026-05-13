@@ -56,7 +56,7 @@ def wxpush(content: str):
 
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
-# ========== 辅助函数（原样保留） ==========
+# ========== 辅助函数 ==========
 async def take_screenshot(browser, tab, name):
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -103,7 +103,63 @@ async def wait_for_element_by_text(tab, text, timeout=10):
         await asyncio.sleep(0.5)
     return False
 
-# ========== Cloudflare 处理（原封不动拷贝） ==========
+# ========== JS 工具函数 ==========
+async def js_click_button_by_text(tab, *texts):
+    """
+    用 JS innerText 匹配按钮并点击，绕过 XPath text() 节点匹配问题（按钮含 SVG 时失效）。
+    texts 为候选文本列表，依次尝试，返回匹配到的文本或 None。
+    """
+    for text in texts:
+        script = f"""
+        (function() {{
+            var btn = Array.from(document.querySelectorAll('button')).find(function(b) {{
+                return (b.innerText || b.textContent || '').indexOf({json.dumps(text)}) !== -1;
+            }});
+            if (btn) {{ btn.click(); return true; }}
+            return false;
+        }})()
+        """
+        result = await tab.execute_script(script)
+        clicked = False
+        if isinstance(result, dict):
+            val = result.get("result", {}).get("result", {}).get("value")
+            clicked = bool(val)
+        elif isinstance(result, bool):
+            clicked = result
+        if clicked:
+            log.info(f"JS 点击按钮成功: '{text}'")
+            return text
+    return None
+
+async def js_fill_input(tab, value, selectors):
+    """
+    用 JS 填写 input，支持多个 CSS selector 候选，触发 React/Vue 所需的 input+change 事件。
+    """
+    for sel in selectors:
+        script = f"""
+        (function() {{
+            var el = document.querySelector({json.dumps(sel)});
+            if (!el) return false;
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(el, {json.dumps(value)});
+            el.dispatchEvent(new Event('input', {{bubbles: true}}));
+            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+            return true;
+        }})()
+        """
+        result = await tab.execute_script(script)
+        ok = False
+        if isinstance(result, dict):
+            val = result.get("result", {}).get("result", {}).get("value")
+            ok = bool(val)
+        elif isinstance(result, bool):
+            ok = result
+        if ok:
+            log.info(f"JS 填写 input 成功: selector='{sel}'")
+            return True
+    return False
+
+# ========== Cloudflare 处理 ==========
 async def manual_cf_click(tab, timeout=15):
     log.info("尝试手动完成 Cloudflare 验证（Shadow DOM 穿透点击）...")
     for i in range(timeout):
@@ -253,7 +309,6 @@ async def create_browser():
             },
         },
         "autofill": {"enabled": False},
-        # 移除了中文字体设置，仅保留英文
         "intl": {"accept_languages": "en-US,en"},
     }
 
@@ -292,40 +347,97 @@ async def login_searcade(browser, tab):
 
     await ensure_cf_passed(tab, await get_url(tab))
 
-    log.info("填写邮箱并点击 Continue with email")
+    log.info("填写邮箱")
+    # 先尝试 pydoll 原生方式
+    email_filled = False
     try:
         email_input = await tab.find(tag_name="input", name="email", timeout=10)
+        await email_input.click()
+        await email_input.type_text(EMAIL, humanize=True)
+        email_filled = True
     except:
-        email_input = await tab.find(tag_name="input", type="email", timeout=10)
-    await email_input.click()
-    await email_input.type_text(EMAIL, humanize=True)
+        pass
+    if not email_filled:
+        try:
+            email_input = await tab.find(tag_name="input", type="email", timeout=10)
+            await email_input.click()
+            await email_input.type_text(EMAIL, humanize=True)
+            email_filled = True
+        except:
+            pass
+    if not email_filled:
+        # 降级：JS 填写（兼容 React 受控组件）
+        ok = await js_fill_input(tab, EMAIL, [
+            'input[name="email"]',
+            'input[type="email"]',
+            'input[placeholder*="email"]',
+            'input[placeholder*="Email"]',
+        ])
+        if not ok:
+            raise Exception("无法填写邮箱输入框")
     await human_delay()
 
-    try:
-        continue_btn = await tab.find(tag_name="button", text="Continue with email", timeout=10)
-    except:
-        continue_btn = await tab.find(tag_name="button", text="Continue", timeout=10)
-    await continue_btn.click()
-    log.info("已点击 Continue with email")
+    log.info("点击 Continue with email 按钮")
+    # 核心修复：改用 JS innerText 匹配，绕过 XPath text() 对含 SVG 按钮的匹配失败问题
+    matched = await js_click_button_by_text(tab, "Continue with email", "Continue")
+    if not matched:
+        # 再降级：按 data-slot 属性或 type=submit 点击
+        fallback = await tab.execute_script("""
+        (function() {
+            var btn = document.querySelector('button[type="submit"]') ||
+                      document.querySelector('button[data-slot="button"]') ||
+                      document.querySelector('form button');
+            if (btn) { btn.click(); return true; }
+            return false;
+        })()
+        """)
+        if not fallback:
+            raise Exception("找不到 Continue with email 按钮")
+        log.info("已通过 fallback 点击提交按钮")
 
     await asyncio.sleep(2)
     await ensure_cf_passed(tab, await get_url(tab))
 
     log.info("等待密码输入框")
+    pass_filled = False
     try:
         pass_input = await tab.find(tag_name="input", name="password", timeout=15)
+        await pass_input.click()
+        await pass_input.type_text(PASSWORD, humanize=True)
+        pass_filled = True
     except:
-        pass_input = await tab.find(tag_name="input", type="password", timeout=15)
-    await pass_input.click()
-    await pass_input.type_text(PASSWORD, humanize=True)
+        pass
+    if not pass_filled:
+        try:
+            pass_input = await tab.find(tag_name="input", type="password", timeout=15)
+            await pass_input.click()
+            await pass_input.type_text(PASSWORD, humanize=True)
+            pass_filled = True
+        except:
+            pass
+    if not pass_filled:
+        ok = await js_fill_input(tab, PASSWORD, [
+            'input[name="password"]',
+            'input[type="password"]',
+        ])
+        if not ok:
+            raise Exception("无法填写密码输入框")
     await human_delay()
 
     log.info("点击登录提交")
-    try:
-        submit_btn = await tab.find(tag_name="button", text="Log in", timeout=10)
-    except:
-        submit_btn = await tab.find(tag_name="button", type="submit", timeout=10)
-    await submit_btn.click()
+    matched = await js_click_button_by_text(tab, "Log in", "Login", "Sign in")
+    if not matched:
+        fallback = await tab.execute_script("""
+        (function() {
+            var btn = document.querySelector('button[type="submit"]') ||
+                      document.querySelector('form button');
+            if (btn) { btn.click(); return true; }
+            return false;
+        })()
+        """)
+        if not fallback:
+            raise Exception("找不到登录提交按钮")
+        log.info("已通过 fallback 点击登录按钮")
 
     if await wait_for_url_contains(tab, "searcade.com", timeout=20):
         log.info("✅ 成功回调至 Searcade")
