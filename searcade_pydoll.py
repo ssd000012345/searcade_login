@@ -10,7 +10,7 @@ from datetime import datetime
 from pydoll.browser.chromium import Chrome
 from pydoll.browser.options import ChromiumOptions
 import ddddocr
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageDraw
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -57,100 +57,216 @@ def wxpush(content: str):
 
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
-# ========== 辅助函数 ==========
-async def replace_sensitive_text(tab):
-    """用 JavaScript 将页面中所有出现的邮箱地址替换为 ***，并清空敏感输入框的值"""
-    try:
-        # 转义邮箱中的特殊字符（如 '.'），用于正则匹配
-        escaped_email = re.escape(EMAIL)
-        script = f"""
-        (function() {{
-            // 1. 替换所有文本节点中的邮箱
-            var emailRegex = new RegExp('{escaped_email}', 'gi');
-            var walker = document.createTreeWalker(
-                document.body,
-                NodeFilter.SHOW_TEXT,
-                {{
-                    acceptNode: function(node) {{
-                        if (node.textContent && emailRegex.test(node.textContent))
-                            return NodeFilter.FILTER_ACCEPT;
-                        return NodeFilter.FILTER_SKIP;
-                    }}
-                }}
-            );
-            var nodes = [];
-            while (walker.nextNode()) nodes.push(walker.currentNode);
-            for (var node of nodes) {{
-                node.textContent = node.textContent.replace(emailRegex, '***');
-            }}
+# ========== 敏感信息处理 ==========
 
-            // 2. 清空所有 email / password input 的值
-            var inputs = document.querySelectorAll('input[type="email"], input[name="email"], input[type="password"], input[name="password"]');
-            for (var inp of inputs) {{
-                inp.value = '';
-                inp.placeholder = '';
-            }}
-        }})()
-        """
+async def mask_sensitive_inputs(tab):
+    """
+    在敏感 input 上叠加固定覆盖层，截图时视觉上完全遮住内容。
+    同时替换页面文本节点中出现的邮箱地址。
+    """
+    script = """
+    (function() {
+        const selectors = [
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[type="password"]',
+            'input[name="password"]',
+            'input[type="text"]'
+        ];
+
+        for (let sel of selectors) {
+            let el = document.querySelector(sel);
+            if (!el) continue;
+            let rect = el.getBoundingClientRect();
+            if (rect.width === 0) continue;
+            if (el._masked) continue;
+            el._masked = true;
+
+            let overlay = document.createElement('div');
+            overlay.style.cssText = `
+                position: fixed;
+                left: ${rect.left}px;
+                top: ${rect.top}px;
+                width: ${rect.width}px;
+                height: ${rect.height}px;
+                background: #333333;
+                z-index: 999999;
+                pointer-events: none;
+                border-radius: 4px;
+            `;
+            overlay.setAttribute('data-mask', 'sensitive');
+            document.body.appendChild(overlay);
+        }
+
+        // 替换文本节点中出现的邮箱
+        const emailInputs = document.querySelectorAll(
+            'input[type="email"], input[name="email"]'
+        );
+        let emailVal = '';
+        emailInputs.forEach(inp => { if (inp.value) emailVal = inp.value; });
+
+        if (emailVal) {
+            const escaped = emailVal.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+            const emailRegex = new RegExp(escaped, 'gi');
+            const walker = document.createTreeWalker(
+                document.body, NodeFilter.SHOW_TEXT
+            );
+            const nodes = [];
+            while (walker.nextNode()) nodes.push(walker.currentNode);
+            nodes.forEach(node => {
+                if (emailRegex.test(node.textContent)) {
+                    node.textContent = node.textContent.replace(
+                        emailRegex, '***@***.***'
+                    );
+                }
+            });
+        }
+
+        return true;
+    })()
+    """
+    try:
         await tab.execute_script(script)
-        log.info("🔒 已通过 JS 将页面中的邮箱替换为 ***")
+        log.info("🔒 已在敏感区域叠加遮罩层")
     except Exception as e:
-        log.warning(f"替换敏感文本失败: {e}")
+        log.warning(f"遮罩叠加失败: {e}")
+
+
+async def unmask_sensitive_inputs(tab):
+    """截图完成后移除所有遮罩层，恢复页面正常交互"""
+    script = """
+    (function() {
+        document.querySelectorAll('[data-mask="sensitive"]').forEach(el => el.remove());
+        document.querySelectorAll('input').forEach(el => { el._masked = false; });
+        return true;
+    })()
+    """
+    try:
+        await tab.execute_script(script)
+        log.info("🔓 遮罩层已移除")
+    except Exception as e:
+        log.warning(f"遮罩移除失败: {e}")
+
 
 async def blur_sensitive_areas(tab, image_path):
-    """对截图中可能残留的敏感区域进行高斯模糊（备用）"""
+    """
+    截图后用 PIL 对敏感区域进行黑色填充（二次保险）。
+    修复了设备像素比（DPR）导致的坐标偏移问题。
+    """
     try:
-        from PIL import Image, ImageFilter
-        elements_info = await tab.execute_script("""
+        result = await tab.execute_script("""
         (function() {
+            const dpr = window.devicePixelRatio || 1;
             const selectors = [
-                'input[type="email"]', 'input[name="email"]',
-                'input[type="password"]', 'input[name="password"]'
+                'input[type="email"]',
+                'input[name="email"]',
+                'input[type="password"]',
+                'input[name="password"]'
             ];
             const rects = [];
             for (let sel of selectors) {
                 let el = document.querySelector(sel);
-                if (el && el.getBoundingClientRect) {
+                if (el) {
                     let rect = el.getBoundingClientRect();
                     if (rect.width > 0 && rect.height > 0) {
-                        rects.push({x: rect.x, y: rect.y, width: rect.width, height: rect.height});
+                        rects.push({
+                            x: Math.floor(rect.x * dpr),
+                            y: Math.floor(rect.y * dpr),
+                            width: Math.ceil(rect.width * dpr),
+                            height: Math.ceil(rect.height * dpr)
+                        });
                     }
                 }
             }
-            return rects;
+            return { rects: rects, dpr: dpr };
         })()
         """)
-        if not isinstance(elements_info, list):
-            elements_info = []
+
+        # 兼容 pydoll 不同版本的返回格式
+        if isinstance(result, dict) and "result" in result:
+            data = result.get("result", {}).get("result", {}).get("value", {})
+        else:
+            data = result
+
+        if not isinstance(data, dict):
+            log.warning(f"blur_sensitive_areas: 返回格式异常 type={type(data)}")
+            return
+
+        rects = data.get("rects", [])
+        dpr   = data.get("dpr", 1)
+        log.info(f"DPR={dpr}, 检测到 {len(rects)} 个敏感区域")
+
+        if not rects:
+            return
+
         img = Image.open(image_path)
-        for rect in elements_info:
+        img_w, img_h = img.size
+        draw = ImageDraw.Draw(img)
+
+        for rect in rects:
             x = int(rect.get('x', 0))
             y = int(rect.get('y', 0))
             w = int(rect.get('width', 0))
             h = int(rect.get('height', 0))
-            if w > 0 and h > 0:
-                box = (max(0, x-5), max(0, y-5), min(img.width, x+w+5), min(img.height, y+h+5))
-                crop = img.crop(box)
-                blurred = crop.filter(ImageFilter.GaussianBlur(radius=15))
-                img.paste(blurred, box)
+
+            if w <= 0 or h <= 0:
+                continue
+
+            padding = 8
+            box = (
+                max(0,     x - padding),
+                max(0,     y - padding),
+                min(img_w, x + w + padding),
+                min(img_h, y + h + padding),
+            )
+            draw.rectangle(box, fill=(40, 40, 40))
+            log.info(f"  已填充区域: {box}")
+
         img.save(image_path)
-        log.info(f"🔒 已对截图进行额外模糊处理: {image_path}")
+        log.info(f"🔒 PIL 二次打码完成: {image_path}")
+
     except Exception as e:
-        log.warning(f"模糊处理失败: {e}")
+        log.warning(f"blur_sensitive_areas 失败: {e}", exc_info=True)
+
 
 async def take_screenshot(browser, tab, name):
+    """
+    安全截图完整流程：
+    1. JS 遮罩覆盖敏感输入框（视觉层）
+    2. 等待浏览器渲染遮罩
+    3. 截图
+    4. PIL 黑色填充二次打码（坐标兜底）
+    5. 移除遮罩，恢复页面
+    """
+    path = None
     try:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
-        # 截图前替换敏感文本
-        await replace_sensitive_text(tab)
-        await asyncio.sleep(0.5)  # 等待 DOM 更新
+
+        # 步骤1: JS 遮罩
+        await mask_sensitive_inputs(tab)
+
+        # 步骤2: 等待一帧渲染（遮罩是 DOM 元素，需要浏览器渲染）
+        await asyncio.sleep(0.8)
+
+        # 步骤3: 截图
         await tab.take_screenshot(path=path)
-        # 可选：再做一次图像模糊（双重保险）
+        log.info(f"📸 原始截图已保存: {path}")
+
+        # 步骤4: PIL 二次打码
         await blur_sensitive_areas(tab, path)
-        log.info(f"📸 截图已保存并打码: {path}")
+
     except Exception as e:
-        log.warning(f"截图失败: {e}")
+        log.warning(f"截图失败: {e}", exc_info=True)
+
+    finally:
+        # 步骤5: 无论成功与否都移除遮罩
+        try:
+            await unmask_sensitive_inputs(tab)
+        except Exception as e:
+            log.warning(f"遮罩清理失败: {e}")
+
+# ========== 辅助函数 ==========
 
 async def get_text(tab):
     try:
@@ -190,6 +306,7 @@ async def wait_for_element_by_text(tab, text, timeout=10):
     return False
 
 # ========== JS 工具函数 ==========
+
 async def js_click_button_by_text(tab, *texts):
     for text in texts:
         script = f"""
@@ -201,10 +318,10 @@ async def js_click_button_by_text(tab, *texts):
             return false;
         }})()
         """
-        result = await tab.execute_script(script)
+        result  = await tab.execute_script(script)
         clicked = False
         if isinstance(result, dict):
-            val = result.get("result", {}).get("result", {}).get("value")
+            val     = result.get("result", {}).get("result", {}).get("value")
             clicked = bool(val)
         elif isinstance(result, bool):
             clicked = result
@@ -219,18 +336,20 @@ async def js_fill_input(tab, value, selectors):
         (function() {{
             var el = document.querySelector({json.dumps(sel)});
             if (!el) return false;
-            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            ).set;
             nativeInputValueSetter.call(el, {json.dumps(value)});
-            el.dispatchEvent(new Event('input', {{bubbles: true}}));
-            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+            el.dispatchEvent(new Event('input',  {{ bubbles: true }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             return true;
         }})()
         """
         result = await tab.execute_script(script)
-        ok = False
+        ok     = False
         if isinstance(result, dict):
             val = result.get("result", {}).get("result", {}).get("value")
-            ok = bool(val)
+            ok  = bool(val)
         elif isinstance(result, bool):
             ok = result
         if ok:
@@ -239,6 +358,7 @@ async def js_fill_input(tab, value, selectors):
     return False
 
 # ========== Cloudflare 处理 ==========
+
 async def manual_cf_click(tab, timeout=15):
     log.info("尝试手动完成 Cloudflare 验证（Shadow DOM 穿透点击）...")
     for i in range(timeout):
@@ -248,7 +368,7 @@ async def manual_cf_click(tab, timeout=15):
             return True
         try:
             shadow_roots = await tab.find_shadow_roots(deep=False)
-            cf_shadow = None
+            cf_shadow    = None
             for sr in shadow_roots:
                 try:
                     html = await sr.inner_html
@@ -260,10 +380,10 @@ async def manual_cf_click(tab, timeout=15):
             if cf_shadow is None:
                 await asyncio.sleep(1)
                 continue
-            iframe_el = await cf_shadow.query('iframe[src*="challenges.cloudflare.com"]', timeout=3)
-            body_el = await iframe_el.find(tag_name="body", timeout=3)
+            iframe_el    = await cf_shadow.query('iframe[src*="challenges.cloudflare.com"]', timeout=3)
+            body_el      = await iframe_el.find(tag_name="body", timeout=3)
             inner_shadow = await body_el.get_shadow_root(timeout=3)
-            checkbox = await inner_shadow.query("span.cb-i", timeout=3)
+            checkbox     = await inner_shadow.query("span.cb-i", timeout=3)
             await checkbox.click()
             log.info("已点击 Cloudflare checkbox，等待验证...")
             await asyncio.sleep(3)
@@ -291,6 +411,7 @@ async def ensure_cf_passed(tab, url, timeout=15):
     return await manual_cf_click(tab)
 
 # ========== 验证码识别（备用） ==========
+
 async def fill_captcha(tab):
     for _ in range(3):
         cap_img = None
@@ -306,10 +427,10 @@ async def fill_captcha(tab):
         if cap_img:
             src = cap_img.get_attribute("src")
             if src and src.startswith("data:image"):
-                b64 = src.split(",", 1)[1]
+                b64      = src.split(",", 1)[1]
                 img_bytes = base64.b64decode(b64)
-                raw = ocr.classification(img_bytes)
-                code = re.sub(r'[^0-9]', '', raw)
+                raw      = ocr.classification(img_bytes)
+                code     = re.sub(r'[^0-9]', '', raw)
                 log.info(f"识别验证码: {code}")
                 await tab.execute_script(f"""
                     (function() {{
@@ -320,8 +441,8 @@ async def fill_captcha(tab):
                         if (input) {{
                             input.focus();
                             input.value = '{code}';
-                            input.dispatchEvent(new Event('input', {{bubbles:true}}));
-                            input.dispatchEvent(new Event('change', {{bubbles:true}}));
+                            input.dispatchEvent(new Event('input',  {{ bubbles:true }}));
+                            input.dispatchEvent(new Event('change', {{ bubbles:true }}));
                         }}
                     }})()
                 """)
@@ -330,6 +451,7 @@ async def fill_captcha(tab):
     return ""
 
 # ========== 浏览器创建 ==========
+
 def _find_chromium() -> str | None:
     candidates = [
         "/usr/bin/chromium-browser",
@@ -343,7 +465,10 @@ def _find_chromium() -> str | None:
             return p
     import subprocess
     try:
-        result = subprocess.run(["which", "chromium-browser"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            ["which", "chromium-browser"],
+            capture_output=True, text=True, timeout=5
+        )
         path = result.stdout.strip()
         if path and os.path.isfile(path):
             return path
@@ -352,9 +477,9 @@ def _find_chromium() -> str | None:
     return None
 
 async def create_browser():
-    opts = ChromiumOptions()
+    opts          = ChromiumOptions()
     opts.headless = False
-    path = _find_chromium()
+    path          = _find_chromium()
     if path:
         opts.binary_location = path
 
@@ -376,6 +501,8 @@ async def create_browser():
     opts.add_argument("--disable-password-generation")
     opts.add_argument("--password-store=basic")
     opts.add_argument("--use-mock-keychain")
+    # 强制 DPR=1，避免高分屏坐标偏移
+    opts.add_argument("--force-device-scale-factor=1")
 
     opts.browser_preferences = {
         "credentials_enable_service": False,
@@ -384,26 +511,27 @@ async def create_browser():
             "password_manager_enabled": False,
             "default_content_setting_values": {
                 "notifications": 2,
-                "geolocation": 2,
+                "geolocation":   2,
             },
         },
         "autofill": {"enabled": False},
-        "intl": {"accept_languages": "en-US,en"},
+        "intl":     {"accept_languages": "en-US,en"},
     }
 
     browser = await Chrome(options=opts).__aenter__()
-    tab = await browser.start()
+    tab     = await browser.start()
 
     try:
-        await tab.execute_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        """)
+        await tab.execute_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => false });"
+        )
     except:
         pass
 
     return browser, tab
 
 # ========== Searcade 登录流程 ==========
+
 async def login_searcade(browser, tab):
     log.info("开始登录 Searcade...")
 
@@ -412,7 +540,7 @@ async def login_searcade(browser, tab):
 
     log.info("点击登录按钮")
     try:
-        login_btn = await tab.find(tag_name="a", text="Login", timeout=10)
+        login_btn = await tab.find(tag_name="a",      text="Login", timeout=10)
     except:
         login_btn = await tab.find(tag_name="button", text="Login", timeout=10)
     await login_btn.click()
@@ -420,7 +548,13 @@ async def login_searcade(browser, tab):
 
     if not await wait_for_url_contains(tab, "userveria.com", timeout=15):
         log.warning("未跳转到 userveria，当前 URL: " + await get_url(tab))
-        oauth_url = f"{USERVERIA_AUTH_URL}?client_id=8305d2e2-e91f-4deb-8909-f669259bc23f&redirect_uri={REDIRECT_URI}&scope=profile&response_type=code"
+        oauth_url = (
+            f"{USERVERIA_AUTH_URL}"
+            f"?client_id=8305d2e2-e91f-4deb-8909-f669259bc23f"
+            f"&redirect_uri={REDIRECT_URI}"
+            f"&scope=profile"
+            f"&response_type=code"
+        )
         await tab.go_to(oauth_url)
         await asyncio.sleep(2)
 
@@ -517,16 +651,16 @@ async def login_searcade(browser, tab):
     log.info("等待回调并确认页面加载完成...")
     signed_in = False
     for _ in range(20):
-        url = await get_url(tab)
+        url  = await get_url(tab)
+        body = await get_text(tab)
         if "searcade.com" in url and "userveria" not in url:
-            body = await get_text(tab)
             if (
                 "successfully signed in" in body.lower()
-                or "your servers" in body.lower()
-                or "logout" in body.lower()
-                or "sign out" in body.lower()
-                or "dashboard" in body.lower()
-                or "welcome back" in body.lower() and "searcade" in url
+                or "your servers"        in body.lower()
+                or "logout"              in body.lower()
+                or "sign out"            in body.lower()
+                or "dashboard"           in body.lower()
+                or ("welcome back"       in body.lower() and "searcade" in url)
             ):
                 signed_in = True
                 log.info("✅ 登录验证成功，当前 URL: " + url)
@@ -544,14 +678,13 @@ async def login_searcade(browser, tab):
             log.error("❌ 登录后未找到成功标识，URL: " + url)
             return False
 
-    log.info("✅ 登录验证成功，准备进入服务器页面")
+    log.info("✅ 登录成功，准备进入服务器页面")
 
     # ========== 进入服务器 ==========
     log.info("滚动页面，寻找服务器卡片...")
     await tab.execute_script("window.scrollBy(0, 400);")
     await asyncio.sleep(1)
 
-    # 修正正则表达式转义警告
     server_clicked = await tab.execute_script("""
     (function() {
         var links = Array.from(document.querySelectorAll('a[href]'));
@@ -594,9 +727,11 @@ async def login_searcade(browser, tab):
         log.info("✅ 服务器 Manage 页面加载成功")
     else:
         log.warning("⚠️ 未找到 Manage 字样，请检查截图 03_server_manage")
+
     return True
 
 # ========== 主流程 ==========
+
 async def main():
     browser, tab = None, None
     try:
