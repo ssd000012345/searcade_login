@@ -10,7 +10,7 @@ from datetime import datetime
 from pydoll.browser.chromium import Chrome
 from pydoll.browser.options import ChromiumOptions
 import ddddocr
-from PIL import Image, ImageFilter  # 新增用于模糊处理
+from PIL import Image, ImageFilter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -58,18 +58,54 @@ def wxpush(content: str):
 ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
 # ========== 辅助函数 ==========
-async def blur_sensitive_areas(tab, image_path):
-    """对截图中敏感区域进行高斯模糊处理"""
+async def replace_sensitive_text(tab):
+    """用 JavaScript 将页面中所有出现的邮箱地址替换为 ***，并清空敏感输入框的值"""
     try:
-        # 获取页面中敏感元素的位置
+        # 转义邮箱中的特殊字符（如 '.'），用于正则匹配
+        escaped_email = re.escape(EMAIL)
+        script = f"""
+        (function() {{
+            // 1. 替换所有文本节点中的邮箱
+            var emailRegex = new RegExp('{escaped_email}', 'gi');
+            var walker = document.createTreeWalker(
+                document.body,
+                NodeFilter.SHOW_TEXT,
+                {{
+                    acceptNode: function(node) {{
+                        if (node.textContent && emailRegex.test(node.textContent))
+                            return NodeFilter.FILTER_ACCEPT;
+                        return NodeFilter.FILTER_SKIP;
+                    }}
+                }}
+            );
+            var nodes = [];
+            while (walker.nextNode()) nodes.push(walker.currentNode);
+            for (var node of nodes) {{
+                node.textContent = node.textContent.replace(emailRegex, '***');
+            }}
+
+            // 2. 清空所有 email / password input 的值
+            var inputs = document.querySelectorAll('input[type="email"], input[name="email"], input[type="password"], input[name="password"]');
+            for (var inp of inputs) {{
+                inp.value = '';
+                inp.placeholder = '';
+            }}
+        }})()
+        """
+        await tab.execute_script(script)
+        log.info("🔒 已通过 JS 将页面中的邮箱替换为 ***")
+    except Exception as e:
+        log.warning(f"替换敏感文本失败: {e}")
+
+async def blur_sensitive_areas(tab, image_path):
+    """对截图中可能残留的敏感区域进行高斯模糊（备用）"""
+    try:
+        from PIL import Image, ImageFilter
         elements_info = await tab.execute_script("""
         (function() {
             const selectors = [
                 'input[type="email"]', 'input[name="email"]',
-                'input[type="password"]', 'input[name="password"]',
-                // 可能包含用户邮箱的文本区域（例如欢迎语中的邮箱）
-                'div:contains("gmail.com")', 'span:contains("gmail.com")',
-                'p:contains("gmail.com")', 'div:contains("@")'
+                'input[type="password"]', 'input[name="password"]'
             ];
             const rects = [];
             for (let sel of selectors) {
@@ -81,27 +117,11 @@ async def blur_sensitive_areas(tab, image_path):
                     }
                 }
             }
-            // 也查找所有包含 @ 的文本节点（粗略）
-            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-                acceptNode: function(node) {
-                    if (node.textContent && node.textContent.includes('@')) return NodeFilter.FILTER_ACCEPT;
-                    return NodeFilter.FILTER_SKIP;
-                }
-            });
-            while (walker.nextNode()) {
-                let range = document.createRange();
-                range.selectNodeContents(walker.currentNode);
-                let rect = range.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                    rects.push({x: rect.x, y: rect.y, width: rect.width, height: rect.height});
-                }
-            }
             return rects;
         })()
         """)
         if not isinstance(elements_info, list):
             elements_info = []
-        # 打开图片并模糊
         img = Image.open(image_path)
         for rect in elements_info:
             x = int(rect.get('x', 0))
@@ -109,13 +129,12 @@ async def blur_sensitive_areas(tab, image_path):
             w = int(rect.get('width', 0))
             h = int(rect.get('height', 0))
             if w > 0 and h > 0:
-                # 扩展模糊区域边界
                 box = (max(0, x-5), max(0, y-5), min(img.width, x+w+5), min(img.height, y+h+5))
                 crop = img.crop(box)
                 blurred = crop.filter(ImageFilter.GaussianBlur(radius=15))
                 img.paste(blurred, box)
         img.save(image_path)
-        log.info(f"🔒 已对截图敏感信息进行模糊处理: {image_path}")
+        log.info(f"🔒 已对截图进行额外模糊处理: {image_path}")
     except Exception as e:
         log.warning(f"模糊处理失败: {e}")
 
@@ -123,10 +142,13 @@ async def take_screenshot(browser, tab, name):
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
+        # 截图前替换敏感文本
+        await replace_sensitive_text(tab)
+        await asyncio.sleep(0.5)  # 等待 DOM 更新
         await tab.take_screenshot(path=path)
-        # 对截图进行敏感信息模糊
+        # 可选：再做一次图像模糊（双重保险）
         await blur_sensitive_areas(tab, path)
-        log.info(f"📸 截图已保存并模糊处理: {path}")
+        log.info(f"📸 截图已保存并打码: {path}")
     except Exception as e:
         log.warning(f"截图失败: {e}")
 
@@ -169,10 +191,6 @@ async def wait_for_element_by_text(tab, text, timeout=10):
 
 # ========== JS 工具函数 ==========
 async def js_click_button_by_text(tab, *texts):
-    """
-    用 JS innerText 匹配按钮并点击，绕过 XPath text() 节点匹配问题（按钮含 SVG 时失效）。
-    texts 为候选文本列表，依次尝试，返回匹配到的文本或 None。
-    """
     for text in texts:
         script = f"""
         (function() {{
@@ -196,9 +214,6 @@ async def js_click_button_by_text(tab, *texts):
     return None
 
 async def js_fill_input(tab, value, selectors):
-    """
-    用 JS 填写 input，支持多个 CSS selector 候选，触发 React/Vue 所需的 input+change 事件。
-    """
     for sel in selectors:
         script = f"""
         (function() {{
@@ -412,7 +427,6 @@ async def login_searcade(browser, tab):
     await ensure_cf_passed(tab, await get_url(tab))
 
     log.info("填写邮箱")
-    # 先尝试 pydoll 原生方式
     email_filled = False
     try:
         email_input = await tab.find(tag_name="input", name="email", timeout=10)
@@ -430,7 +444,6 @@ async def login_searcade(browser, tab):
         except:
             pass
     if not email_filled:
-        # 降级：JS 填写（兼容 React 受控组件）
         ok = await js_fill_input(tab, EMAIL, [
             'input[name="email"]',
             'input[type="email"]',
@@ -501,10 +514,9 @@ async def login_searcade(browser, tab):
             raise Exception("找不到登录提交按钮")
         log.info("已通过 fallback 点击登录按钮")
 
-    # 等待成功回调到 searcade.com，并且页面内容也加载完成
     log.info("等待回调并确认页面加载完成...")
     signed_in = False
-    for _ in range(20):  # 最多等 10 秒
+    for _ in range(20):
         url = await get_url(tab)
         if "searcade.com" in url and "userveria" not in url:
             body = await get_text(tab)
@@ -539,12 +551,12 @@ async def login_searcade(browser, tab):
     await tab.execute_script("window.scrollBy(0, 400);")
     await asyncio.sleep(1)
 
-    # 点击服务器卡片（href 含 /servers/ 的链接）
+    # 修正正则表达式转义警告
     server_clicked = await tab.execute_script("""
     (function() {
         var links = Array.from(document.querySelectorAll('a[href]'));
         var srv = links.find(function(a) {
-            return /\\/servers\\/|admin\\/servers/.test(a.href);
+            return (/\\/servers\\/|admin\\/servers/).test(a.href);
         });
         if (srv) { srv.click(); return srv.href; }
         return null;
