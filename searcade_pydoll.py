@@ -67,12 +67,12 @@ def get_email_variants(email: str) -> list[str]:
     domain   = email.split("@")[1] if "@" in email else ""
 
     variants = [
-        email,                                              # ssd000012345@gmail.com
-        email.replace("@", "at").replace(".", "-"),         # ssd000012345atgmail-com
-        email.replace("@", "_at_").replace(".", "_"),       # ssd000012345_at_gmail_com
+        email,                                              
+        email.replace("@", "at").replace(".", "-"),         
+        email.replace("@", "_at_").replace(".", "_"),       
         email.replace("@", "[at]").replace(".", "[dot]"),
         email.replace("@", " at ").replace(".", " dot "),
-        username,                                           # ssd000012345
+        username,                                           
     ]
     if domain:
         variants.append(domain)
